@@ -6,6 +6,6 @@ install:
   - pip install .[dev]
 script:
   - pipdeptree
-  - coverage run --source=TODO -m pytest
+  - coverage run --source=bgzipseek -m pytest
   - coverage report -m
-  #- mypy TODO
+  #- mypy bgzipseek
