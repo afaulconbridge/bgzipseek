@@ -1,97 +1,99 @@
 import io
-import itertools
 import os
-import random
-import tempfile
+import os.path
 
 import pytest
 
-from bgzipseek import BGZipSeekReader, BGZipSeekWriter
+from bgzipseek import BGZipSeek
 
 
 @pytest.fixture
-def temporary_filename():
-    temporary_file = tempfile.NamedTemporaryFile(delete=False)
-    temporary_filename = temporary_file.name
-    temporary_file.close()
-    yield temporary_file.name
-    os.remove(temporary_filename)
-
-
-def random_content_generator(rng):
-    while True:
-        line = " ".join(
-            (
-                "".join(
-                    (rng.choices("abcdefghijklmnopqrstuvwxyz", k=rng.randint(5, 25)))
-                )
-                for i in range(rng.randint(5, 50))
-            )
-        )
-        yield line
-
-
-@pytest.fixture
-def random_content():
-    rng = random.Random(42)
-    content = ("\n".join(itertools.islice(random_content_generator(rng), 25))).encode(
-        "utf-8"
+def test_txt():
+    pth = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "test_200.txt"
     )
-    return content
+    return open(pth, "rb")
 
 
 @pytest.fixture
-def bgzip_filename_to_read(temporary_filename, random_content):
-    with BGZipSeekWriter(open(temporary_filename, "wb"), blocksize=1024) as bgzipwriter:
-        bgzipwriter.write(random_content)
-    yield temporary_filename
+def test_blockgz():
+    pth = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "test_200.txt.gz"
+    )
+    return open(pth, "rb")
 
 
-class TestBGZipSeekReader:
-    def test_basic(self, bgzip_filename_to_read, random_content):
-        with BGZipSeekReader(open(bgzip_filename_to_read, "rb")) as bgzipreader:
-            read_content = bytes(bgzipreader.read(len(random_content) + 10))
-            assert random_content[-20:] == read_content[-20:]
-            assert random_content[:20] == read_content[:20]
-            assert len(random_content) == len(read_content)
+class TestBGZipSeek:
+    def test_basic(self, test_txt, test_blockgz):
+        content = test_txt.read()
+        blockgzip = BGZipSeek(test_blockgz)
+        # read the whole thing
+        print(len(content))
+        print(blockgzip.size)
+        assert len(content) == blockgzip.size
+        # assert content == blockgzip.read()
 
-    def test_chunks(self, bgzip_filename_to_read, random_content):
-        with BGZipSeekReader(open(bgzip_filename_to_read, "rb")) as bgzipreader:
-            read_content = bytes(bgzipreader.read(32))
-            assert random_content[:32] == read_content
-            assert 32 == bgzipreader.tell()
-            read_content = bytes(bgzipreader.read(32))
-            assert random_content[32:64] == read_content
+    def test_seek(self, test_txt, test_blockgz):
+        content = test_txt.read()
+        blockgzip = BGZipSeek(test_blockgz)
 
-    def test_seek(self, bgzip_filename_to_read, random_content):
-        with BGZipSeekReader(open(bgzip_filename_to_read, "rb")) as bgzipreader:
-            assert bgzipreader.seekable
+        # read the first X bytes
+        assert 0 == blockgzip.tell()
+        assert content[:16] == blockgzip.read(16)
+        assert 16 == blockgzip.tell()
 
-            assert bgzipreader.seek(32, io.SEEK_SET)
-            read_content = bytes(bgzipreader.read(32))
-            assert random_content[32:64] == read_content
+        # seek back to the start implicit
+        blockgzip.seek(0)
+        assert 0 == blockgzip.tell()
+        assert content[:16] == blockgzip.read(16)
+        assert 16 == blockgzip.tell()
 
-            assert bgzipreader.seek(32, io.SEEK_CUR)
-            read_content = bytes(bgzipreader.read(32))
-            assert random_content[96:128] == read_content
+        # seek back to the start explicit
+        blockgzip.seek(0, io.SEEK_SET)
+        assert 0 == blockgzip.tell()
+        assert content[:16] == blockgzip.read(16)
+        assert 16 == blockgzip.tell()
 
+        # relative seek forward
+        blockgzip.seek(16, io.SEEK_CUR)
+        assert 32 == blockgzip.tell()
+        assert content[32:48] == blockgzip.read(16)
+        assert 48 == blockgzip.tell()
 
-class TestBGZipSeekWriter:
-    def test_basic(self, temporary_filename, random_content):
-        with BGZipSeekWriter(open(temporary_filename, "wb")) as bgzipwriter:
-            written_size = bgzipwriter.write(random_content)
-            assert written_size == len(random_content)
+        # relative seek backward
+        blockgzip.seek(-16, io.SEEK_CUR)
+        assert 32 == blockgzip.tell()
+        assert content[32:48] == blockgzip.read(16)
+        assert 48 == blockgzip.tell()
+        # relative seek end
+        blockgzip.seek(-16, io.SEEK_END)
+        assert len(content) - 16 == blockgzip.tell()
+        assert content[-16:] == blockgzip.read(16)
+        assert len(content) == blockgzip.tell()
 
-    def test_closing(self, temporary_filename, random_content):
-        with BGZipSeekWriter(open(temporary_filename, "wb")) as bgzipwriter:
-            bgzipwriter.write(random_content)
-            assert not bgzipwriter.closed
+        # seek outside of file
+        blockgzip.seek(0)
+        with pytest.raises(OSError):
+            blockgzip.seek(-len(content) - 1, io.SEEK_CUR)
+        with pytest.raises(OSError):
+            blockgzip.seek(-len(content) - 1, io.SEEK_END)
+        with pytest.raises(OSError):
+            blockgzip.seek(-1, io.SEEK_SET)
+        with pytest.raises(OSError):
+            blockgzip.seek(-1)
 
-        assert bgzipwriter.closed
+    def test_block_boundary(self, test_txt, test_blockgz):
+        content = test_txt.read()
+        blockgzip = BGZipSeek(test_blockgz)
+        blockgzip.seek(65536 - 8)
+        assert 65536 - 8 == blockgzip.tell()
+        assert content[65536 - 8 : 65536 + 8] == blockgzip.read(16)
+        assert 65536 + 8 == blockgzip.tell()
 
-        with pytest.raises(ValueError):
-            bgzipwriter.write(random_content)
-
-        assert not bgzipwriter.readable()
-        with open(temporary_filename, "rb") as rawfile:
-            assert 0 < len(rawfile.read())
+        #    def test_block_span(self, test_txt, test_blockgz):
+        #        content = test_txt.read()
+        #        blockgzip = BGZipSeek(test_blockgz)
+        blockgzip.seek(0)
+        assert 0 == blockgzip.tell()
+        assert content[: 65536 + 8] == blockgzip.read(65536 + 8)
+        assert 65536 + 8 == blockgzip.tell()

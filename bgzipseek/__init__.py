@@ -1,7 +1,3 @@
-import io
-import struct
-import zlib
-
 """
 
 Much of this was inspired by https://biopython.org/DIST/docs/api/Bio.bgzf-pysrc.html which is MIT licensed
@@ -10,194 +6,170 @@ BGZip format is documented inside https://samtools.github.io/hts-specs/SAMv1.pdf
 
 """
 
-bgzf_header = b"\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00\x42\x43\x02\x00"
+import io
+import struct
+import zlib
 
 
-class BGZipSeekReader(io.RawIOBase):
-    def __init__(self, fileobj):
-        self.fileobj = fileobj
-        self.is_closed = False
-        self.file_offset = 0
+class BGZipSeek(io.BufferedIOBase):
+    def __init__(self, raw):
+        self.raw = raw
+        self.position = 0
         self.blocksizes_compressed = []
-        self._preload_blocksizes_compressed()  # TODO do on first use, not initialization
-        self.blocksize = self.blocksizes_compressed[
-            0
-        ]  # assume all blocks sized as first
+        self.blocksizes_uncompressed = []
+        # TODO do on first use, not initialization
+        self._preload_blocksizes()
+        self.block_uncompressed_index = 0
+        self.block_uncoompressed = None
+        self._uncompress_block(0)
 
-    def read(self, size):
-        if size < 0:
-            raise NotImplementedError
-
-        # get current block start, block end
-        initial_offset = self.tell()
-        block_i = initial_offset // self.blocksize
-        # if its past end of file
-        if block_i >= len(self.blocksizes_compressed):
-            return b""
-
-        # assume all previous blocks same size uncompressed
-        block_offset_uncompressed = block_i * self.blocksize
-        block_offset_uncompressed_internal = initial_offset - block_offset_uncompressed
-
-        # TODO make one system call to read `size` compressed bytes, which will include `size` uncompressed bytes
-
-        response = b""
-        while len(response) < size:
-            block_offset_compressed = (
-                sum((x for x in self.blocksizes_compressed[:block_i])) + block_i
-            )
-            block_size_compressed = self.blocksizes_compressed[block_i]
-            block_bytes = self._get_block_content(
-                block_offset_compressed, block_size_compressed
-            )
-            # jump to internal offset
-            block_bytes = block_bytes[block_offset_uncompressed_internal:]
-            block_offset_uncompressed_internal = 0
-            response += block_bytes
-            block_i += 1
-            # if this was the last block, stop
-            if block_i >= len(self.blocksizes_compressed):
-                break
-
-        # trim back to fit
-        response = response[:size]
-        self.file_offset += len(response)
-        return response
-
-    def seek(self, offset, whence=io.SEEK_SET):
-        if whence == io.SEEK_SET:
-            self.file_offset = offset
-        elif whence == io.SEEK_CUR:
-            self.file_offset += offset
-        elif whence == io.SEEK_END:
-            # TODO implement this
-            raise NotImplementedError
-        else:
-            raise NotImplementedError
-        return self.file_offset
-
-    def _preload_blocksizes_compressed(self):
+    def _preload_blocksizes(self):
         offset = 0
         while True:
-            size = self._get_block_size_compressed(offset)
-            if not size:
+            compressed_size = self._get_block_size_compressed(offset)
+            if not compressed_size:
                 # last block in file
                 break
-            self.blocksizes_compressed.append(size)
+            uncompressed_size = self._get_block_size_uncompressed(
+                offset, compressed_size
+            )
+            self.blocksizes_compressed.append(compressed_size)
+            self.blocksizes_uncompressed.append(uncompressed_size)
             # move to next block
-            offset = offset + size + 1
+            offset = offset + compressed_size
+        # TODO check valid end of file empty block
 
     def _get_block_size_compressed(self, block_offset):
         # read the first few bytes of the block from the source
-        self.fileobj.seek(block_offset + 16)
-        block_header = self.fileobj.read(2)
+        # TODO validate this is a sensible block
+        self.raw.seek(block_offset + 16)
+        block_header = self.raw.read(2)
+        assert len(block_header) <= 2, len(block_header)
         if len(block_header) == 0:
             # block not in file, end
             return None
-        block_size = struct.unpack("<H", block_header)[0]
-        return block_size
+        block_size_compressed = struct.unpack("<H", block_header)[0] + 1
+        return block_size_compressed
 
-    # TODO add caching
-    def _get_block_content(self, block_offset, block_size):
-        self.fileobj.seek(block_offset)
-        compressed_bytes = self.fileobj.read(block_size + 1)
-        decompressed_bytes = self._decompress_bytes(compressed_bytes)
-        return decompressed_bytes
+    def _get_block_size_uncompressed(self, block_offset, compressed_size):
+        # read the last few bytes of the block from the source
+        # TODO validate this is a sensible block
+        self.raw.seek(block_offset + compressed_size - 4)
+        block_footer = self.raw.read(4)
+        if len(block_footer) == 0:
+            # block not in file, end
+            return 0
+        block_size_uncompressed = struct.unpack("<I", block_footer)[0]
 
-    def _decompress_bytes(self, compressed_bytes):
+        assert block_size_uncompressed <= 65536, block_size_uncompressed
+
+        return block_size_uncompressed
+
+    def _uncompress_block(self, i):
+        compressed_offset = sum(self.blocksizes_compressed[:i])
+        self.raw.seek(compressed_offset)
+        compressed_bytes = self.raw.read(self.blocksizes_compressed[i])
+        assert len(compressed_bytes) == self.blocksizes_compressed[i]
+
         decompressor = zlib.decompressobj(15 + 32)
-        decompressed_bytes = decompressor.decompress(compressed_bytes)
-        assert not decompressor.unconsumed_tail
-        assert not decompressor.unused_data
-        return decompressed_bytes
+        uncompressed_bytes = decompressor.decompress(compressed_bytes)
 
-    def close(self):
-        self.fileobj.close()
-        self.is_closed = True
+        assert self.blocksizes_uncompressed[i] == len(uncompressed_bytes), i
 
-    @property
-    def closed(self):
-        return self.fileobj.closed
+        assert not decompressor.unconsumed_tail, len(decompressor.unconsumed_tail)
+        assert not decompressor.unused_data, len(decompressor.unused_data)
 
-    def tell(self):
-        return self.file_offset
+        self.block_uncompressed_index = i
+        self.block_uncoompressed = uncompressed_bytes
 
-    def __enter__(self):
-        return self
+    def _find_block_index(self, uncompressed_offset):
+        i = 0
+        uncompressed_running_total = 0
+        while i < len(self.blocksizes_uncompressed):
+            uncompressed_running_total += self.blocksizes_uncompressed[i]
+            if uncompressed_running_total > uncompressed_offset:
+                return i
 
-    def __exit__(self, *args):
-        self.close()
+            i += 1
+        return None  # not inside any blocks
 
-
-class BGZipSeekWriter(io.RawIOBase):
-    def __init__(self, fileobj, blocksize=65536, compresslevel=-1):
-        self.fileobj = fileobj
-        self.buffered_bytes = b""
-        self.blocksize = blocksize
-        self.compresslevel = compresslevel
-
-    def close(self):
-        self._write_block(self.buffered_bytes)
-        self.fileobj.close()
+    def __repr__(self):
+        return f"BlockGZip({self.raw})"
 
     @property
-    def closed(self):
-        return self.fileobj.closed
+    def size(self):
+        # TODO calculate once and store
+        return sum(self.blocksizes_uncompressed)
 
-    def readable(self):
-        return False
-
-    def writable(self):
+    def seekable(self):
         return True
 
-    def write(self, bytes_to_write):
-        if self.closed:
-            raise ValueError()
+    def tell(self):
+        return self.position
 
-        self.buffered_bytes = self.buffered_bytes + bytes_to_write
-        written_size = 0
-        while len(self.buffered_bytes) > self.blocksize:
-            written_size += self._write_block(self.buffered_bytes[: self.blocksize])
-            self.buffered_bytes = self.buffered_bytes[self.blocksize :]
-        return len(bytes_to_write)
-
-    def _write_block(self, block):
-        data = self._compress_block(block)
-        self.fileobj.write(data)
-        return len(block)
-
-    def _compress_block(self, block):
-        """Write to file a single BGZF compressed block."""
-        assert len(block) <= self.blocksize, "block too large"
-
-        # -15 is 2**15 window size no header
-        c = zlib.compressobj(self.compresslevel, wbits=-15)
-        compressed = c.compress(block) + c.flush()
-        del c
-        assert len(compressed) < self.blocksize, "did not compress"
-        crc = zlib.crc32(block)
-        # Should cope with a mix of Python platforms...
-        if crc < 0:
-            crc = struct.pack("<i", crc)
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            if offset < 0:
+                raise OSError("Unable to seek before start")
+            # seeking past the end is permitted
+            self.position = offset
+        elif whence == io.SEEK_CUR:
+            if self.position + offset < 0:
+                raise OSError("Unable to seek before start")
+            # seeking past the end is permitted
+            self.position += offset
+        elif whence == io.SEEK_END:
+            if offset < -self.size:
+                raise OSError("Unable to seek before start")
+            self.position = self.size + offset
         else:
-            crc = struct.pack("<I", crc)
-        bsize = struct.pack("<H", len(compressed) + 25)  # includes -1
-        crc = struct.pack("<I", zlib.crc32(block) & 0xFFFFFFFF)
-        uncompressed_length = struct.pack("<I", len(block))
-        # Fixed 16 bytes,
-        # gzip magic bytes (4) mod time (4),
-        # gzip flag (1), os (1), extra length which is six (2),
-        # sub field which is BC (2), sub field length of two (2),
-        # Variable data,
-        # 2 bytes: block length as BC sub field (2)
-        # X bytes: the data
-        # 8 bytes: crc (4), uncompressed data length (4)
-        data = bgzf_header + bsize + compressed + crc + uncompressed_length
+            raise ValueError(
+                "invalid whence (%r, should be %d, %d, %d)"
+                % (whence, io.SEEK_SET, io.SEEK_CUR, io.SEEK_END)
+            )
 
-        return data
+        block_index_updated = self._find_block_index(self.position)
+        if (
+            block_index_updated is not None
+            and block_index_updated != self.block_uncompressed_index
+        ):
+            self._uncompress_block(block_index_updated)
 
-    def __enter__(self):
-        return self
+        return self.position
 
-    def __exit__(self, *args):
-        self.close()
+    def readable(self):
+        return True
+
+    def read(self, size=-1):
+        if size >= 0:
+            return self.read1(size)
+        else:
+            return self.read1(self.size - self.position)
+
+    def read1(self, size):
+        print(f"read1({size})")
+        value = b""
+        block_position = self.position - sum(
+            self.blocksizes_uncompressed[: self.block_uncompressed_index]
+        )
+        value_extra = self.block_uncoompressed[block_position : block_position + size]
+        if not value_extra:
+            return value
+        assert len(value_extra)
+        assert len(value_extra) <= size
+        value = value + value_extra
+        size -= len(value_extra)
+        self.seek(len(value_extra), io.SEEK_CUR)
+        if size:
+            # move forward, loading next block if necessary
+            value = value + self.read1(size)
+        return value
+
+    def writable(self):
+        return False
+
+    def truncate(self):
+        raise OSError("not writable")
+
+    def write(self, bytes_to_write):
+        raise OSError("not writable")
