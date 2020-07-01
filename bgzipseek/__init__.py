@@ -147,7 +147,6 @@ class BGZipSeek(io.BufferedIOBase):
             return self.read1(self.size - self.position)
 
     def read1(self, size):
-        print(f"read1({size})")
         value = b""
         block_position = self.position - sum(
             self.blocksizes_uncompressed[: self.block_uncompressed_index]
